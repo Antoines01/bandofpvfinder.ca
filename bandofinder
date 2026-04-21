@@ -283,6 +283,19 @@ body{margin:0;font-family:system-ui;background:#0b0b0b;color:#fff}
         return new Response(uiHTML(), { headers: { "Content-Type": "text/html; charset=utf-8", ...cors() } });
       }
 
+      if (req.method === "GET" && url.pathname === "/health") {
+        return json({
+          status: "ok",
+          service: "bandofpvfinder-api",
+          time: new Date().toISOString(),
+          kv_configured: !!env.RESULTS,
+        });
+      }
+
+      if (req.method === "GET" && url.pathname === "/api") {
+        return new Response(apiDocsHTML(), { headers: { "Content-Type": "text/html; charset=utf-8", ...cors() } });
+      }
+
       // ─── KV requis ────────────────────────────────────────────────────────
       const needsKVPrefixes = [
         "/register", "/login", "/logout", "/change-password",
@@ -444,9 +457,23 @@ body{margin:0;font-family:system-ui;background:#0b0b0b;color:#fff}
       // ─── Search / Generate ────────────────────────────────────────────────
       if (req.method === "POST" && url.pathname === "/generate") {
         const body = await req.json().catch(() => ({}));
-        if (!body.email || !String(body.email).includes("@")) return json({ error: "Email valide requis" }, 400);
+        const authUser = await getAuthUser(req, env);
+        const rawEmail = String(body.email || authUser?.email || "").trim().toLowerCase();
+        if (!rawEmail || !rawEmail.includes("@")) return json({ error: "Email valide requis (body.email ou token Bearer)" }, 400);
         if (!body.city) return json({ error: "Ville ou région requise" }, 400);
         if (!body.country) return json({ error: "Pays requis" }, 400);
+
+        const cooldownSeconds = clampInt(env?.SEARCH_COOLDOWN_SECONDS || 3, 1, 30);
+        const cooldownKey = `cooldown/generate/${rawEmail}`;
+        const cooldownActive = await env.RESULTS.get(cooldownKey);
+        if (cooldownActive) {
+          return json({
+            error: "RATE_LIMIT",
+            message: "Attends quelques secondes avant une nouvelle recherche.",
+            retry_after_seconds: cooldownSeconds,
+          }, 429);
+        }
+        await env.RESULTS.put(cooldownKey, "1", { expirationTtl: cooldownSeconds, httpMetadata: { contentType: "text/plain; charset=utf-8" } });
 
         const q = `${String(body.city).trim()}, ${String(body.country).trim()}`.trim();
         const geo = await geocode(q);
@@ -462,16 +489,14 @@ body{margin:0;font-family:system-ui;background:#0b0b0b;color:#fff}
         let premium = false;
 
         if (includeWebRequested) {
-          const emailLower = String(body.email || "").trim().toLowerCase();
-          premium = await hasPremiumAccess(env, emailLower);
+          premium = await hasPremiumAccess(env, rawEmail);
           if (premium) {
             webEnabled = true;
             webCandidates = await searchWebCandidates({ env, city: String(body.city || "").trim(), country: String(body.country || "").trim(), center: { lat: geo.lat, lon: geo.lon }, radiusKm, maxResults: webMax });
           }
         }
 
-        const emailLower = String(body.email || "").trim().toLowerCase();
-        const creditCheck = await useCredit(env, emailLower);
+        const creditCheck = await useCredit(env, rawEmail);
         if (!creditCheck.ok) {
           return json({
             error: "PLUS DE CRÉDITS",
@@ -503,6 +528,7 @@ body{margin:0;font-family:system-ui;background:#0b0b0b;color:#fff}
           web_enabled: webEnabled, premium,
           premium_required: premiumRequired,
           message: premiumRequired ? "Recherche Web désactivée (Premium requis). Résultats OSM seulement." : (webEnabled ? "Recherche Web activée (Premium)." : "Résultats OSM."),
+          search_mode: webEnabled ? "osm+web" : "osm",
           url: `https://${domain}/${key}`,
           spots,
           credits_remaining: creditCheck.data.credits,
@@ -1282,6 +1308,45 @@ async function vote(stars){
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+   API DOCS PAGE
+═══════════════════════════════════════════════════════════════════════ */
+function apiDocsHTML() {
+  return `<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>API — FPV Bando Finder</title>
+  <style>
+    :root{--bg:#0a0b10;--card:#11131a;--text:#edf0f8;--muted:#99a0b5;--accent:#e8611a;--border:rgba(255,255,255,.1)}
+    *{box-sizing:border-box} body{margin:0;font-family:Inter,system-ui,sans-serif;background:radial-gradient(circle at top,#181a25 0%,#0a0b10 55%);color:var(--text)}
+    .wrap{max-width:960px;margin:0 auto;padding:28px 18px 42px}
+    h1{font-size:34px;margin:4px 0 6px}.muted{color:var(--muted)}
+    .grid{display:grid;gap:12px;margin-top:18px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px}
+    code{background:#0a0c12;border:1px solid var(--border);padding:2px 8px;border-radius:8px;color:#ffc3a2}
+    .method{font-weight:700;color:var(--accent)}
+    a{color:#ff9f6a}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <p class="muted"><a href="/">← Retour à l'interface</a></p>
+    <h1>API FPV Bando Finder</h1>
+    <p class="muted">API JSON + interface communautaire pour trouver et publier des spots FPV / urbex.</p>
+    <div class="grid">
+      <div class="card"><span class="method">GET</span> <code>/health</code><p class="muted">Statut du service + présence KV.</p></div>
+      <div class="card"><span class="method">POST</span> <code>/generate</code><p class="muted">Recherche de spots (OSM, Web Premium). <br/>Supporte <code>email</code> ou authentification <code>Authorization: Bearer ...</code>.</p></div>
+      <div class="card"><span class="method">POST</span> <code>/register</code>, <code>/login</code>, <code>/logout</code><p class="muted">Authentification et session.</p></div>
+      <div class="card"><span class="method">POST</span> <code>/submit-spot</code> / <span class="method">POST</span> <code>/vote-spot</code><p class="muted">Contribuer à la base de spots.</p></div>
+      <div class="card"><span class="method">GET</span> <code>/top-spots</code>, <code>/regions</code><p class="muted">Classements filtrables par région/pays.</p></div>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
    MAIN UI HTML — Version 2026 complète redesign
 ═══════════════════════════════════════════════════════════════════════ */
 function uiHTML() {
@@ -1502,6 +1567,12 @@ a:hover { color: var(--accent2); }
 }
 .icon-btn:hover { background: var(--surface2); border-color: var(--border2); color: var(--text); }
 .icon-btn svg { width: 17px; height: 17px; }
+.icon-link {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+}
 
 /* ══════════════════════════════════════════
    SIDEBAR COMPONENTS
@@ -2062,6 +2133,7 @@ select {
       </nav>
 
       <div class="navbar-right">
+        <a class="icon-btn icon-link" href="/api" title="Documentation API" aria-label="Documentation API">API</a>
         <div class="user-pill" id="authPill" role="status" aria-live="polite">Non connecté</div>
         <button class="icon-btn" id="toggleLeft" title="Mon compte" aria-label="Ouvrir mon compte">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>
